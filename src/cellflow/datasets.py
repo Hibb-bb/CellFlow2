@@ -93,6 +93,12 @@ def zesta(
         **kwargs,
     )
 
+def marson(
+    path: str = "./",
+    **kwargs: Any,
+) -> ad.AnnData:
+
+    return 
 
 def _load_dataset(
     filename: str,

@@ -25,27 +25,60 @@ from cellflow.preprocessing import transfer_labels, compute_wknn, centered_pca, 
 from cellflow.metrics import compute_r_squared, compute_e_distance
 
 
-adata = cellflow.datasets.zesta(force_download=False)
-adata = adata[adata.obs["tissue"] == "Central Nervous System"]
+# ---- Marson dataset (minimal changes from original notebook) ----
+MARSON_TRAIN_PATH = "/projects/b1094/ywl7940/CellFlow2/marson/train/train.h5ad"
+adata = ad.read_h5ad(MARSON_TRAIN_PATH)
 
+# Representation: prefer X_hvg in obsm (fallback to X)
+sample_rep = "X_hvg" if "X_hvg" in adata.obsm_keys() else "X"
 
-adata_train = adata[adata.obs["condition"]!="cdx4_cdx1a_24"].copy()
-adata_test = adata[(adata.obs["condition"]=="cdx4_cdx1a_24") | (adata.obs["condition"]=="control_control_18")].copy()
-# adata_train.n_obs, adata_test.n_obs
+# Control definition: guide_target_gene_symbol == "NTC"
+CONTROL_LABEL = "NTC"
+CONTROL_COL = "is_control"
+PERT_COL = "guide_target_gene_symbol"
+DONOR_COL = "donor_id"
+TIME_COL = "timepoint"
 
+missing = [c for c in (PERT_COL, DONOR_COL, TIME_COL) if c not in adata.obs.columns]
+if missing:
+    raise KeyError(
+        f"Missing required obs columns: {missing}. "
+        f"Available obs columns (first 50): {list(map(str, adata.obs.columns[:50]))}"
+    )
+
+adata.obs[CONTROL_COL] = (adata.obs[PERT_COL].astype(str) == CONTROL_LABEL)
+
+# Simple one-hot embeddings for donor_id and timepoint
+donor_cats = adata.obs[DONOR_COL].astype("category").cat.categories
+time_cats = adata.obs[TIME_COL].astype("category").cat.categories
+
+adata.uns["donor_id_embeddings"] = {
+    d: np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
+}
+adata.uns["timepoint_embeddings"] = {
+    t: np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
+}
+
+# Simple train/test split (random) while keeping code structure similar
+rs = np.random.RandomState(0)
+mask_test = rs.rand(adata.n_obs) < 0.2
+adata_train = adata[~mask_test].copy()
+adata_test = adata[mask_test].copy()
 
 cf = CellFlow(adata_train, solver="otfm")
 
-
-
 cf.prepare_data(
-    sample_rep = "X_aligned",
-    control_key = "first_t_control",
-    perturbation_covariates = {"genetic_perturbation": ("gene_target_1" , "gene_target_2")},
-    perturbation_covariate_reps = {"genetic_perturbation": "gene_embeddings"},
-    sample_covariates = ("logtime",),
+    sample_rep=sample_rep,
+    control_key=CONTROL_COL,
+    perturbation_covariates={"genetic_perturbation": (PERT_COL,)},
+    perturbation_covariate_reps=None,
+    sample_covariates=(DONOR_COL, TIME_COL),
+    sample_covariate_reps={
+        DONOR_COL: "donor_id_embeddings",
+        TIME_COL: "timepoint_embeddings",
+    },
     split_covariates = None,
-    max_combination_length = 2,
+    max_combination_length=1,
     null_value = 0.0,
 )
 
@@ -65,7 +98,8 @@ cf.prepare_validation_data(
 
 layers_before_pool = {
     "genetic_perturbation": {"layer_type": "mlp", "dims": [512, 512], "dropout_rate": 0.0},
-    "logtime": {"layer_type": "mlp", "dims": [512, 512], "dropout_rate": 0.0},
+    DONOR_COL: {"layer_type": "mlp", "dims": [512, 512], "dropout_rate": 0.0},
+    TIME_COL: {"layer_type": "mlp", "dims": [512, 512], "dropout_rate": 0.0},
 }
 
 layers_after_pool = {
