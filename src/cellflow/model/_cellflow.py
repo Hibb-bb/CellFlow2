@@ -18,7 +18,7 @@ from cellflow import _constants
 from cellflow._compat import BrownianBridge, ConstantNoiseFlow
 from cellflow._types import ArrayLike, Layers_separate_input_t, Layers_t
 from cellflow.data._data import ConditionData, TrainingData, ValidationData
-from cellflow.data._dataloader import OOCTrainSampler, PredictionSampler, TrainSampler, ValidationSampler
+from cellflow.data._dataloader import MultiShardTrainSampler, OOCTrainSampler, PredictionSampler, TrainSampler, ValidationSampler
 from cellflow.data._datamanager import DataManager
 from cellflow.model._utils import _write_predictions
 from cellflow.networks import _velocity_field
@@ -518,6 +518,9 @@ class CellFlow:
         callbacks: Sequence[BaseCallback] = [],
         monitor_metrics: Sequence[str] = [],
         out_of_core_dataloading: bool = False,
+        shard_paths: Sequence[str] | None = None,
+        shard_metadata_path: str | None = None,
+        shard_sample_rep: str = "X",
     ) -> None:
         """Train the model.
 
@@ -553,16 +556,26 @@ class CellFlow:
         - :attr:`cellflow.model.CellFlow.dataloader` - the training dataloader.
         - :attr:`cellflow.model.CellFlow.solver` - the trained solver.
         """
-        if self.train_data is None:
-            raise ValueError("Data not initialized. Please call `prepare_data` first.")
+        if (shard_paths is None) != (shard_metadata_path is None):
+            raise ValueError("`shard_paths` and `shard_metadata_path` must be provided together.")
+
+        if self.train_data is None and shard_paths is None:
+            raise ValueError("Data not initialized. Please call `prepare_data` first, or pass `shard_paths`.")
 
         if self.trainer is None:
             raise ValueError("Model not initialized. Please call `prepare_model` first.")
 
-        if out_of_core_dataloading:
-            self._dataloader = OOCTrainSampler(data=self.train_data, batch_size=batch_size)
+        if shard_paths is not None and shard_metadata_path is not None:
+            self._dataloader = MultiShardTrainSampler(
+                shard_paths=list(shard_paths),
+                metadata_path=shard_metadata_path,
+                batch_size=batch_size,
+                sample_rep=shard_sample_rep,
+            )
+        elif out_of_core_dataloading:
+            self._dataloader = OOCTrainSampler(data=self.train_data, batch_size=batch_size)  # type: ignore[arg-type]
         else:
-            self._dataloader = TrainSampler(data=self.train_data, batch_size=batch_size)
+            self._dataloader = TrainSampler(data=self.train_data, batch_size=batch_size)  # type: ignore[arg-type]
         validation_loaders = {k: ValidationSampler(v) for k, v in self.validation_data.items() if k != "predict_kwargs"}
         self._trainer.predict_kwargs = self.validation_data.get("predict_kwargs", {})
 

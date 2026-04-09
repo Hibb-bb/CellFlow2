@@ -1,4 +1,5 @@
 import abc
+import json
 import queue
 import threading
 from collections.abc import Generator
@@ -9,7 +10,13 @@ import numpy as np
 
 from cellflow.data._data import PredictionData, TrainingData, ValidationData
 
-__all__ = ["TrainSampler", "ValidationSampler", "PredictionSampler", "OOCTrainSampler"]
+__all__ = [
+    "TrainSampler",
+    "MultiShardTrainSampler",
+    "ValidationSampler",
+    "PredictionSampler",
+    "OOCTrainSampler",
+]
 
 
 class TrainSampler:
@@ -97,6 +104,166 @@ class TrainSampler:
     def data(self):
         """The training data."""
         return self._data
+
+
+class MultiShardTrainSampler:
+    """Streaming multi-shard sampler producing the same batch dict as :class:`TrainSampler`.
+
+    This sampler keeps only per-cell integer masks/indices in memory and fetches the
+    actual cell representation rows on demand from `.h5ad` shards.
+
+    Notes
+    -----
+    The provided metadata JSON must contain per-cell arrays needed for pairing.
+    Expected keys (minimum):
+
+    - ``rows_per_shard``: list[int]
+    - ``split_covariates_mask``: list[int] (len = n_cells)
+    - ``perturbation_covariates_mask``: list[int] (len = n_cells)
+    - ``control_to_perturbation``: dict[str|int, list[int]]
+    - ``condition_data``: dict[str, array-like] (optional; if omitted, no condition returned)
+    """
+
+    def __init__(
+        self,
+        *,
+        shard_paths: list[str],
+        metadata_path: str,
+        batch_size: int = 1024,
+        sample_rep: str = "X",
+        dtype: str | None = "float32",
+    ) -> None:
+        if len(shard_paths) == 0:
+            raise ValueError("`shard_paths` must be non-empty.")
+        self.shard_paths = list(shard_paths)
+        self.batch_size = int(batch_size)
+        self.sample_rep = sample_rep
+        self._dtype = np.dtype(dtype) if dtype is not None else None
+
+        with open(metadata_path) as f:
+            meta = json.load(f)
+
+        rows_per_shard = meta.get("rows_per_shard", None)
+        if rows_per_shard is None:
+            raise KeyError("metadata is missing required key `rows_per_shard`.")
+        self.rows_per_shard = np.asarray(rows_per_shard, dtype=np.int64)
+        if len(self.rows_per_shard) != len(self.shard_paths):
+            raise ValueError("`rows_per_shard` length must match `shard_paths` length.")
+
+        self.shard_offsets = np.concatenate([[0], np.cumsum(self.rows_per_shard, dtype=np.int64)])
+        self.n_cells = int(self.shard_offsets[-1])
+
+        split_mask = meta.get("split_covariates_mask", None)
+        pert_mask = meta.get("perturbation_covariates_mask", None)
+        if split_mask is None or pert_mask is None:
+            raise KeyError(
+                "metadata must include `split_covariates_mask` and `perturbation_covariates_mask` (per-cell arrays)."
+            )
+        self.split_covariates_mask = np.asarray(split_mask, dtype=np.int32)
+        self.perturbation_covariates_mask = np.asarray(pert_mask, dtype=np.int32)
+        if len(self.split_covariates_mask) != self.n_cells or len(self.perturbation_covariates_mask) != self.n_cells:
+            raise ValueError("per-cell mask lengths must match sum(rows_per_shard).")
+
+        c2p = meta.get("control_to_perturbation", None)
+        if c2p is None:
+            raise KeyError("metadata is missing required key `control_to_perturbation`.")
+        self.control_to_perturbation: dict[int, np.ndarray] = {
+            int(k): np.asarray(v, dtype=np.int32) for k, v in c2p.items()
+        }
+        self._control_to_perturbation_keys = sorted(self.control_to_perturbation.keys())
+
+        condition_data = meta.get("condition_data", None)
+        self.condition_data: dict[str, np.ndarray] | None = None
+        if condition_data is not None:
+            self.condition_data = {k: np.asarray(v) for k, v in condition_data.items()}
+
+        self._has_condition_data = self.condition_data is not None
+
+        self.n_source_dists = int(np.max(self.split_covariates_mask)) + 1 if self.n_cells > 0 else 0
+        self.n_target_dists = int(np.max(self.perturbation_covariates_mask)) + 1 if self.n_cells > 0 else 0
+
+        # Build per-group indices once (int arrays only, no expression matrix).
+        self._control_indices_by_source: list[np.ndarray] = [
+            np.where(self.split_covariates_mask == s)[0].astype(np.int32) for s in range(self.n_source_dists)
+        ]
+        self._pert_indices_by_target: list[np.ndarray] = [
+            np.where(self.perturbation_covariates_mask == t)[0].astype(np.int32) for t in range(self.n_target_dists)
+        ]
+
+        self._shards = None  # lazily opened backed AnnData objects
+
+    def _open_shards(self) -> None:
+        if self._shards is not None:
+            return
+        import anndata as ad
+
+        self._shards = [ad.read_h5ad(p, backed="r") for p in self.shard_paths]
+
+    def _sample_target_dist_idx(self, source_dist_idx: int, rng: np.random.Generator) -> int:
+        return int(rng.choice(self.control_to_perturbation[source_dist_idx]))
+
+    def _get_embeddings(self, idx: int) -> dict[str, np.ndarray]:
+        if self.condition_data is None:
+            raise ValueError("No condition data available.")
+        result: dict[str, np.ndarray] = {}
+        for key, arr in self.condition_data.items():
+            result[key] = np.expand_dims(arr[idx], 0)
+        return result
+
+    def _sample_from_index(self, rng: np.random.Generator, idcs: np.ndarray) -> np.ndarray:
+        if len(idcs) == 0:
+            raise ValueError("No valid indices found for requested distribution.")
+        return rng.choice(idcs, size=self.batch_size, replace=True).astype(np.int32)
+
+    def _global_to_shard_local(self, global_idcs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # shard_id = max i such that offsets[i] <= gid
+        shard_ids = np.searchsorted(self.shard_offsets[1:], global_idcs, side="right").astype(np.int32)
+        local_ids = (global_idcs - self.shard_offsets[shard_ids]).astype(np.int64)
+        return shard_ids, local_ids
+
+    def _fetch_rows(self, global_idcs: np.ndarray) -> np.ndarray:
+        self._open_shards()
+        assert self._shards is not None
+
+        shard_ids, local_ids = self._global_to_shard_local(global_idcs.astype(np.int64))
+        out_chunks: list[np.ndarray] = [None] * len(global_idcs)  # type: ignore[list-item]
+
+        # group by shard to minimize random IO overhead
+        for shard_id in np.unique(shard_ids):
+            shard_id_int = int(shard_id)
+            positions = np.where(shard_ids == shard_id_int)[0]
+            loc = local_ids[positions]
+
+            shard = self._shards[shard_id_int]
+            if self.sample_rep == "X":
+                X = shard.X[loc, :]
+            else:
+                # only support obsm keys (common for PCA representations)
+                X = shard.obsm[self.sample_rep][loc, :]
+
+            X = np.asarray(X)
+            if self._dtype is not None:
+                X = X.astype(self._dtype, copy=False)
+
+            for pos_i, row in zip(positions, X, strict=False):
+                out_chunks[int(pos_i)] = row
+
+        return np.stack(out_chunks, axis=0)
+
+    def sample(self, rng: np.random.Generator) -> dict[str, Any]:
+        source_dist_idx = int(rng.integers(0, self.n_source_dists))
+        src_ids = self._sample_from_index(rng, self._control_indices_by_source[source_dist_idx])
+        src_batch = self._fetch_rows(src_ids)
+
+        target_dist_idx = self._sample_target_dist_idx(source_dist_idx, rng)
+        tgt_ids = self._sample_from_index(rng, self._pert_indices_by_target[target_dist_idx])
+        tgt_batch = self._fetch_rows(tgt_ids)
+
+        if not self._has_condition_data:
+            return {"src_cell_data": src_batch, "tgt_cell_data": tgt_batch}
+
+        condition_batch = self._get_embeddings(target_dist_idx)
+        return {"src_cell_data": src_batch, "tgt_cell_data": tgt_batch, "condition": condition_batch}
 
 
 class BaseValidSampler(abc.ABC):
