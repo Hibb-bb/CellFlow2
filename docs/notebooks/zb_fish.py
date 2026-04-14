@@ -5,6 +5,9 @@ warnings.simplefilter("ignore", UserWarning)
 warnings.simplefilter("ignore", FutureWarning)
 warnings.simplefilter("ignore", SettingWithCopyWarning)
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -30,7 +33,12 @@ from cellflow.metrics import compute_r_squared, compute_e_distance
 
 # ---- Marson dataset (minimal changes from original notebook) ----
 MARSON_TRAIN_PATH = "/projects/b1094/ywl7940/CellFlow2/marson/train/train.h5ad"
+MARSON_METADATA_PATH = Path(MARSON_TRAIN_PATH).parent / "metadata.json"
+DE_STATS_CSV = Path(__file__).resolve().parent / "DE_stats.suppl_table.csv"
 adata = ad.read_h5ad(MARSON_TRAIN_PATH)
+
+with MARSON_METADATA_PATH.open() as f:
+    marson_meta = json.load(f)
 
 # Representation: prefer X_hvg in obsm (fallback to X)
 sample_rep = "X_hvg" if "X_hvg" in adata.obsm_keys() else "X"
@@ -62,9 +70,16 @@ adata.obs[CONDITION_COL] = (
     + adata.obs[TIME_COL].astype(str)
 )
 
-# Simple one-hot embeddings for donor_id and timepoint
+# Embeddings: timepoint vocabulary from metadata.json; donor still from adata (no donor list in JSON).
 donor_cats = adata.obs[DONOR_COL].astype("category").cat.categories
-time_cats = adata.obs[TIME_COL].astype("category").cat.categories
+time_cats = list(marson_meta["timepoints_included"])
+adata_time_vals = set(adata.obs[TIME_COL].astype(str).unique())
+meta_time_vals = set(map(str, time_cats))
+if adata_time_vals - meta_time_vals:
+    raise ValueError(
+        f"adata {TIME_COL} has values not listed in metadata timepoints_included: "
+        f"{sorted(adata_time_vals - meta_time_vals)}"
+    )
 
 adata.uns["donor_id_embeddings"] = {
     d: np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
@@ -73,7 +88,10 @@ adata.uns["timepoint_embeddings"] = {
     t: np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
 }
 
-pert_genes = sorted(adata.obs[PERT_COL].astype(str).unique())
+_de_stats = pd.read_csv(DE_STATS_CSV, usecols=["target_contrast_gene_name"])
+_from_csv = _de_stats["target_contrast_gene_name"].dropna().astype(str).unique().tolist()
+_from_adata = adata.obs[PERT_COL].astype(str).unique().tolist()
+pert_genes = sorted(set(_from_csv) | set(_from_adata) | {CONTROL_LABEL})
 adata.uns[PERT_EMB_KEY] = {
     g: np.eye(len(pert_genes), dtype=float)[i] for i, g in enumerate(pert_genes)
 }
