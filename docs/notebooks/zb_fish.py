@@ -42,6 +42,11 @@ TIME_COL = "timepoint"
 CONDITION_COL = "condition"
 CELL_TYPE_COL = "cell_type_broad"
 
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "zb_fish_checkpoints"
+CHECKPOINT_FILE_PREFIX = "zb_fish"
+CHECKPOINT_PATH = CHECKPOINT_DIR / f"{CHECKPOINT_FILE_PREFIX}_CellFlow.pkl"
+
+
 def create_metadata():
 
     # ---- Marson dataset (minimal changes from original notebook) ----
@@ -178,6 +183,9 @@ cf.train(
         valid_freq=30_000,
     )
 
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+cf.save(str(CHECKPOINT_DIR), file_prefix=CHECKPOINT_FILE_PREFIX, overwrite=True)
+
 e_distances_train = cf.trainer.training_logs["train_e_distance_mean"]
 e_distances_test = cf.trainer.training_logs["test_e_distance_mean"]
 
@@ -201,6 +209,8 @@ axes[1].grid(True)
 
 plt.tight_layout()
 plt.savefig("stuff.png")
+
+cf = CellFlow.load(str(CHECKPOINT_PATH))
 
 # --- Post-training analysis (201_zebrafish_continuous-style; Marson obs / categorical time) ---
 covariate_data_train = (
