@@ -1,0 +1,12 @@
+# Paths for zb_fish.py (override with: python zb_fish.py --config /path/to/custom.yaml)
+paths:
+  de_stats_csv: /projects/b1094/ywl7940/CellFlow2/docs/notebooks/DE_stats.suppl_table.csv
+  marson_train_dir: /hpc/projects/group.chi/ai/cell-studio/from_CW_to_Bruno/ML_splits/marson_expr_2/train_hvg
+  marson_test_dir: /hpc/projects/group.chi/ai/cell-studio/from_CW_to_Bruno/ML_splits/marson_expr_2/test_hvg
+  marson_validation_dir: /hpc/projects/group.chi/ai/cell-studio/from_CW_to_Bruno/ML_splits/marson_expr_2/valid_hvg
+  # If null, defaults to <marson_train_dir>/metadata.json
+  metadata_json: null
+
+checkpoint:
+  dir: /hpc/mydata/ywen/cellflow_saves
+  file_prefix: cellflow

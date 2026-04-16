@@ -41,6 +41,7 @@ dependencies = [
   "orbax",
   "ott-jax[neural]>=0.5",
   "pyarrow",              # required for dask.dataframe
+  "pyyaml>=6",
   "scanpy",
   "scikit-learn==1.5.1",
   "scipy<1.16",           # see https://github.com/statsmodels/statsmodels/issues/9584

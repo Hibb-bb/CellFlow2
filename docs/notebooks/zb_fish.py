@@ -5,8 +5,11 @@ warnings.simplefilter("ignore", UserWarning)
 warnings.simplefilter("ignore", FutureWarning)
 warnings.simplefilter("ignore", SettingWithCopyWarning)
 
+import argparse
 import json
+import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -30,6 +33,8 @@ from cellflow.plotting import plot_condition_embedding
 from cellflow.preprocessing import transfer_labels, compute_wknn, centered_pca, project_pca, reconstruct_pca
 from cellflow.metrics import compute_r_squared, compute_e_distance
 
+import yaml
+
 
 # Control definition: guide_target_gene_symbol == "NTC"
 CONTROL_LABEL = "NTC"
@@ -42,35 +47,52 @@ TIME_COL = "timepoint"
 CONDITION_COL = "condition"
 CELL_TYPE_COL = "cell_type_broad"
 
-CHECKPOINT_DIR = Path(__file__).resolve().parent / "zb_fish_checkpoints"
-CHECKPOINT_FILE_PREFIX = "zb_fish"
+
+def _load_run_config() -> dict[str, Any]:
+    parser = argparse.ArgumentParser(description="zb_fish CellFlow pipeline")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).resolve().parent / "zb_fish.yaml",
+        help="YAML with paths.paths.*, paths.metadata_json, checkpoint.*",
+    )
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"zb_fish.py: ignoring unrecognized CLI args: {unknown}", file=sys.stderr)
+    config_path = args.config.expanduser().resolve()
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+    with config_path.open() as f:
+        return yaml.safe_load(f)
+
+
+RUN_CONFIG = _load_run_config()
+_ckpt = RUN_CONFIG.get("checkpoint") or {}
+_default_ckpt_dir = Path(__file__).resolve().parent / "zb_fish_checkpoints"
+CHECKPOINT_DIR = Path(_ckpt.get("dir", _default_ckpt_dir))
+CHECKPOINT_FILE_PREFIX = str(_ckpt.get("file_prefix", "zb_fish"))
 CHECKPOINT_PATH = CHECKPOINT_DIR / f"{CHECKPOINT_FILE_PREFIX}_CellFlow.pkl"
 
 
-def create_metadata():
-
-    # ---- Marson dataset (minimal changes from original notebook) ----
-    MARSON_TRAIN_DIR = Path("/projects/b1094/ywl7940/CellFlow2/marson/train")
-    MARSON_METADATA_PATH = MARSON_TRAIN_DIR / "metadata.json"
-    DE_STATS_CSV = Path(__file__).resolve().parent / "DE_stats.suppl_table.csv"
-    h5ad_paths = sorted(MARSON_TRAIN_DIR.glob("*.h5ad"))
+def concat_h5ad_dir(directory: Path) -> ad.AnnData:
+    """Load every ``*.h5ad`` in ``directory`` (sorted) and concatenate along obs."""
+    directory = directory.expanduser().resolve()
+    h5ad_paths = sorted(directory.glob("*.h5ad"))
     if not h5ad_paths:
-        raise FileNotFoundError(f"No .h5ad files found in {MARSON_TRAIN_DIR}")
-    adata = ad.concat([ad.read_h5ad(p) for p in h5ad_paths], axis=0, merge="same")
+        raise FileNotFoundError(f"No .h5ad files found in {directory}")
+    return ad.concat([ad.read_h5ad(p) for p in h5ad_paths], axis=0, merge="same")
 
-    with MARSON_METADATA_PATH.open() as f:
-        marson_meta = json.load(f)
 
-    # Representation: prefer X_hvg in obsm (fallback to X)
-    sample_rep = "X_hvg" if "X_hvg" in adata.obsm_keys() else "X"
-
+def _assert_obs_columns(adata: ad.AnnData, label: str) -> None:
     missing = [c for c in (PERT_COL, DONOR_COL, TIME_COL) if c not in adata.obs.columns]
     if missing:
         raise KeyError(
-            f"Missing required obs columns: {missing}. "
+            f"{label}: missing required obs columns: {missing}. "
             f"Available obs columns (first 50): {list(map(str, adata.obs.columns[:50]))}"
         )
 
+
+def _apply_condition_columns(adata: ad.AnnData) -> None:
     adata.obs[CONTROL_COL] = (adata.obs[PERT_COL].astype(str) == CONTROL_LABEL)
     adata.obs[CONDITION_COL] = (
         adata.obs[PERT_COL].astype(str)
@@ -80,40 +102,93 @@ def create_metadata():
         + adata.obs[TIME_COL].astype(str)
     )
 
-    donor_cats = adata.obs[DONOR_COL].astype("category").cat.categories
+
+def _copy_embedding_uns(src: ad.AnnData, dst: ad.AnnData) -> None:
+    for key in ("donor_id_embeddings", "timepoint_embeddings", PERT_EMB_KEY):
+        dst.uns[key] = src.uns[key]
+
+
+def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, ad.AnnData, ad.AnnData, str, ad.AnnData]:
+    """Load train / test / validation from separate folders; return ref AnnData (concat) for analysis."""
+    cfg = config if config is not None else RUN_CONFIG
+    paths = cfg["paths"]
+
+    train_dir = Path(paths["marson_train_dir"])
+    test_dir = Path(paths["marson_test_dir"])
+    validation_dir = Path(paths["marson_validation_dir"])
+    de_stats_csv = Path(paths["de_stats_csv"])
+
+    meta_path = paths.get("metadata_json")
+    if meta_path is None or str(meta_path).lower() in ("null", "none", ""):
+        marson_metadata_path = train_dir / "metadata.json"
+    else:
+        marson_metadata_path = Path(meta_path)
+
+    adata_train = concat_h5ad_dir(train_dir)
+    adata_test = concat_h5ad_dir(test_dir)
+    adata_val = concat_h5ad_dir(validation_dir)
+
+    for obj, name in (
+        (adata_train, "train"),
+        (adata_test, "test"),
+        (adata_val, "validation"),
+    ):
+        _assert_obs_columns(obj, name)
+
+    with marson_metadata_path.open() as f:
+        marson_meta = json.load(f)
+
+    sample_rep = "X_hvg" if "X_hvg" in adata_train.obsm_keys() else "X"
+
+    donor_values: set[str] = set()
+    for obj in (adata_train, adata_test, adata_val):
+        donor_values.update(obj.obs[DONOR_COL].astype(str).unique())
+    donor_cats = pd.Index(sorted(donor_values))
+
     time_cats = list(marson_meta["timepoint"])
-    adata_time_vals = set(adata.obs[TIME_COL].astype(str).unique())
     meta_time_vals = set(map(str, time_cats))
-    if adata_time_vals - meta_time_vals:
-        raise ValueError(
-            f"adata {TIME_COL} has values not listed in metadata timepoint: "
-            f"{sorted(adata_time_vals - meta_time_vals)}"
-        )
+    for obj, name in (
+        (adata_train, "train"),
+        (adata_test, "test"),
+        (adata_val, "validation"),
+    ):
+        adata_time_vals = set(obj.obs[TIME_COL].astype(str).unique())
+        if adata_time_vals - meta_time_vals:
+            raise ValueError(
+                f"{name} {TIME_COL} has values not listed in metadata timepoint: "
+                f"{sorted(adata_time_vals - meta_time_vals)}"
+            )
 
-    adata.uns["donor_id_embeddings"] = {
-        d: np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
+    adata_train.uns["donor_id_embeddings"] = {
+        str(d): np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
     }
-    adata.uns["timepoint_embeddings"] = {
-        t: np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
+    adata_train.uns["timepoint_embeddings"] = {
+        str(t): np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
     }
 
-    _de_stats = pd.read_csv(DE_STATS_CSV, usecols=["target_contrast_gene_name"])
+    _de_stats = pd.read_csv(de_stats_csv, usecols=["target_contrast_gene_name"])
     _from_csv = _de_stats["target_contrast_gene_name"].dropna().astype(str).unique().tolist()
-    _from_adata = adata.obs[PERT_COL].astype(str).unique().tolist()
-    pert_genes = sorted(set(_from_csv) | set(_from_adata) | {CONTROL_LABEL})
-    adata.uns[PERT_EMB_KEY] = {
+    pert_values: set[str] = set()
+    for obj in (adata_train, adata_test, adata_val):
+        pert_values.update(obj.obs[PERT_COL].astype(str).unique())
+    pert_genes = sorted(set(_from_csv) | pert_values | {CONTROL_LABEL})
+    adata_train.uns[PERT_EMB_KEY] = {
         g: np.eye(len(pert_genes), dtype=float)[i] for i, g in enumerate(pert_genes)
     }
 
-    # Simple train/test split (random) while keeping code structure similar
-    rs = np.random.RandomState(0)
-    mask_test = rs.rand(adata.n_obs) < 0.2
-    adata_train = adata[~mask_test].copy()
-    adata_test = adata[mask_test].copy()
+    _copy_embedding_uns(adata_train, adata_test)
+    _copy_embedding_uns(adata_train, adata_val)
 
-    return adata_train, adata_test, sample_rep
+    _apply_condition_columns(adata_train)
+    _apply_condition_columns(adata_test)
+    _apply_condition_columns(adata_val)
 
-adata_train, adata_test, sample_rep = create_metadata()
+    adata_ref = ad.concat([adata_train, adata_test, adata_val], axis=0, merge="same")
+
+    return adata_train, adata_test, adata_val, sample_rep, adata_ref
+
+
+adata_train, adata_test, adata_val, sample_rep, adata = create_metadata()
 
 cf = CellFlow(adata_train, solver="otfm")
 
@@ -144,6 +219,13 @@ cf.prepare_validation_data(
     name="test",
     n_conditions_on_log_iteration=None,
     n_conditions_on_train_end=None,
+)
+
+cf.prepare_validation_data(
+    adata_val,
+    name="val",
+    n_conditions_on_log_iteration=10,
+    n_conditions_on_train_end=10,
 )
 
 # Narrower than tutorial defaults to lower Slurm/JAX memory use (see batch_size below).
@@ -186,25 +268,28 @@ cf.train(
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 cf.save(str(CHECKPOINT_DIR), file_prefix=CHECKPOINT_FILE_PREFIX, overwrite=True)
 
-e_distances_train = cf.trainer.training_logs["train_e_distance_mean"]
-e_distances_test = cf.trainer.training_logs["test_e_distance_mean"]
-
-iterations_train = np.arange(len(e_distances_train))
-iterations_test  = np.arange(len(e_distances_test))
-
-fig, axes = plt.subplots(1, 2, figsize=(18, 6))
-
-axes[0].plot(iterations_train, e_distances_train, linestyle='-', color='blue', label='Energy distance training data')
-axes[0].set_xlabel('Iteration')
-axes[0].set_ylabel('Energy distance')
-axes[0].legend()
-axes[0].grid(True)
-
-axes[1].plot(iterations_test, e_distances_test, linestyle='-', color='red', label='Energy distance test data')
-axes[1].set_xlabel('Validation iteration')
-axes[1].set_ylabel('Energy distance')
-axes[1].legend()
-axes[1].grid(True)
+_ed_keys = [
+    k
+    for k in ("train_e_distance_mean", "test_e_distance_mean", "val_e_distance_mean")
+    if k in cf.trainer.training_logs
+]
+_colors = {"train_e_distance_mean": "blue", "test_e_distance_mean": "red", "val_e_distance_mean": "green"}
+_labels = {
+    "train_e_distance_mean": "Energy distance (train)",
+    "test_e_distance_mean": "Energy distance (test)",
+    "val_e_distance_mean": "Energy distance (val)",
+}
+n_ed = max(len(_ed_keys), 1)
+fig, axes = plt.subplots(1, n_ed, figsize=(6 * n_ed, 6))
+if n_ed == 1:
+    axes = [axes]
+for ax, key in zip(axes, _ed_keys):
+    series = cf.trainer.training_logs[key]
+    ax.plot(np.arange(len(series)), series, linestyle="-", color=_colors.get(key, "black"), label=_labels.get(key, key))
+    ax.set_xlabel("Validation iteration" if key != "train_e_distance_mean" else "Iteration")
+    ax.set_ylabel("Energy distance")
+    ax.legend()
+    ax.grid(True)
 
 
 plt.tight_layout()
