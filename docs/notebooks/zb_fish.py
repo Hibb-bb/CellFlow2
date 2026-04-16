@@ -31,18 +31,6 @@ from cellflow.preprocessing import transfer_labels, compute_wknn, centered_pca, 
 from cellflow.metrics import compute_r_squared, compute_e_distance
 
 
-# ---- Marson dataset (minimal changes from original notebook) ----
-MARSON_TRAIN_PATH = "/projects/b1094/ywl7940/CellFlow2/marson/train/train.h5ad"
-MARSON_METADATA_PATH = Path(MARSON_TRAIN_PATH).parent / "metadata.json"
-DE_STATS_CSV = Path(__file__).resolve().parent / "DE_stats.suppl_table.csv"
-adata = ad.read_h5ad(MARSON_TRAIN_PATH)
-
-with MARSON_METADATA_PATH.open() as f:
-    marson_meta = json.load(f)
-
-# Representation: prefer X_hvg in obsm (fallback to X)
-sample_rep = "X_hvg" if "X_hvg" in adata.obsm_keys() else "X"
-
 # Control definition: guide_target_gene_symbol == "NTC"
 CONTROL_LABEL = "NTC"
 CONTROL_COL = "is_control"
@@ -54,53 +42,73 @@ TIME_COL = "timepoint"
 CONDITION_COL = "condition"
 CELL_TYPE_COL = "cell_type_broad"
 
-missing = [c for c in (PERT_COL, DONOR_COL, TIME_COL) if c not in adata.obs.columns]
-if missing:
-    raise KeyError(
-        f"Missing required obs columns: {missing}. "
-        f"Available obs columns (first 50): {list(map(str, adata.obs.columns[:50]))}"
+def create_metadata():
+
+    # ---- Marson dataset (minimal changes from original notebook) ----
+    MARSON_TRAIN_DIR = Path("/projects/b1094/ywl7940/CellFlow2/marson/train")
+    MARSON_METADATA_PATH = MARSON_TRAIN_DIR / "metadata.json"
+    DE_STATS_CSV = Path(__file__).resolve().parent / "DE_stats.suppl_table.csv"
+    h5ad_paths = sorted(MARSON_TRAIN_DIR.glob("*.h5ad"))
+    if not h5ad_paths:
+        raise FileNotFoundError(f"No .h5ad files found in {MARSON_TRAIN_DIR}")
+    adata = ad.concat([ad.read_h5ad(p) for p in h5ad_paths], axis=0, merge="same")
+
+    with MARSON_METADATA_PATH.open() as f:
+        marson_meta = json.load(f)
+
+    # Representation: prefer X_hvg in obsm (fallback to X)
+    sample_rep = "X_hvg" if "X_hvg" in adata.obsm_keys() else "X"
+
+    missing = [c for c in (PERT_COL, DONOR_COL, TIME_COL) if c not in adata.obs.columns]
+    if missing:
+        raise KeyError(
+            f"Missing required obs columns: {missing}. "
+            f"Available obs columns (first 50): {list(map(str, adata.obs.columns[:50]))}"
+        )
+
+    adata.obs[CONTROL_COL] = (adata.obs[PERT_COL].astype(str) == CONTROL_LABEL)
+    adata.obs[CONDITION_COL] = (
+        adata.obs[PERT_COL].astype(str)
+        + "||"
+        + adata.obs[DONOR_COL].astype(str)
+        + "||"
+        + adata.obs[TIME_COL].astype(str)
     )
 
-adata.obs[CONTROL_COL] = (adata.obs[PERT_COL].astype(str) == CONTROL_LABEL)
-adata.obs[CONDITION_COL] = (
-    adata.obs[PERT_COL].astype(str)
-    + "||"
-    + adata.obs[DONOR_COL].astype(str)
-    + "||"
-    + adata.obs[TIME_COL].astype(str)
-)
+    donor_cats = adata.obs[DONOR_COL].astype("category").cat.categories
+    time_cats = list(marson_meta["timepoint"])
+    adata_time_vals = set(adata.obs[TIME_COL].astype(str).unique())
+    meta_time_vals = set(map(str, time_cats))
+    if adata_time_vals - meta_time_vals:
+        raise ValueError(
+            f"adata {TIME_COL} has values not listed in metadata timepoint: "
+            f"{sorted(adata_time_vals - meta_time_vals)}"
+        )
 
-# Embeddings: timepoint vocabulary from metadata.json; donor still from adata (no donor list in JSON).
-donor_cats = adata.obs[DONOR_COL].astype("category").cat.categories
-time_cats = list(marson_meta["timepoints_included"])
-adata_time_vals = set(adata.obs[TIME_COL].astype(str).unique())
-meta_time_vals = set(map(str, time_cats))
-if adata_time_vals - meta_time_vals:
-    raise ValueError(
-        f"adata {TIME_COL} has values not listed in metadata timepoints_included: "
-        f"{sorted(adata_time_vals - meta_time_vals)}"
-    )
+    adata.uns["donor_id_embeddings"] = {
+        d: np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
+    }
+    adata.uns["timepoint_embeddings"] = {
+        t: np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
+    }
 
-adata.uns["donor_id_embeddings"] = {
-    d: np.eye(len(donor_cats), dtype=float)[i] for i, d in enumerate(donor_cats)
-}
-adata.uns["timepoint_embeddings"] = {
-    t: np.eye(len(time_cats), dtype=float)[i] for i, t in enumerate(time_cats)
-}
+    _de_stats = pd.read_csv(DE_STATS_CSV, usecols=["target_contrast_gene_name"])
+    _from_csv = _de_stats["target_contrast_gene_name"].dropna().astype(str).unique().tolist()
+    _from_adata = adata.obs[PERT_COL].astype(str).unique().tolist()
+    pert_genes = sorted(set(_from_csv) | set(_from_adata) | {CONTROL_LABEL})
+    adata.uns[PERT_EMB_KEY] = {
+        g: np.eye(len(pert_genes), dtype=float)[i] for i, g in enumerate(pert_genes)
+    }
 
-_de_stats = pd.read_csv(DE_STATS_CSV, usecols=["target_contrast_gene_name"])
-_from_csv = _de_stats["target_contrast_gene_name"].dropna().astype(str).unique().tolist()
-_from_adata = adata.obs[PERT_COL].astype(str).unique().tolist()
-pert_genes = sorted(set(_from_csv) | set(_from_adata) | {CONTROL_LABEL})
-adata.uns[PERT_EMB_KEY] = {
-    g: np.eye(len(pert_genes), dtype=float)[i] for i, g in enumerate(pert_genes)
-}
+    # Simple train/test split (random) while keeping code structure similar
+    rs = np.random.RandomState(0)
+    mask_test = rs.rand(adata.n_obs) < 0.2
+    adata_train = adata[~mask_test].copy()
+    adata_test = adata[mask_test].copy()
 
-# Simple train/test split (random) while keeping code structure similar
-rs = np.random.RandomState(0)
-mask_test = rs.rand(adata.n_obs) < 0.2
-adata_train = adata[~mask_test].copy()
-adata_test = adata[mask_test].copy()
+    return adata_train, adata_test, sample_rep
+
+adata_train, adata_test, sample_rep = create_metadata()
 
 cf = CellFlow(adata_train, solver="otfm")
 
