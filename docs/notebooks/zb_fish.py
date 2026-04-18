@@ -147,6 +147,7 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
 
     time_cats = list(marson_meta["timepoints_included"])
     meta_time_vals = set(map(str, time_cats))
+    meta_time_vals = ["rest", "8hr", "48hr"]
     for obj, name in (
         (adata_train, "train"),
         (adata_test, "test"),
