@@ -145,7 +145,7 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
         donor_values.update(obj.obs[DONOR_COL].astype(str).unique())
     donor_cats = pd.Index(sorted(donor_values))
 
-    time_cats = list(marson_meta["timepoint"])
+    time_cats = list(marson_meta["timepoints_included"])
     meta_time_vals = set(map(str, time_cats))
     for obj, name in (
         (adata_train, "train"),
@@ -154,6 +154,11 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
     ):
         adata_time_vals = set(obj.obs[TIME_COL].astype(str).unique())
         if adata_time_vals - meta_time_vals:
+
+            print()
+            print(adata_time_vals, meta_time_vals)
+            print()
+            
             raise ValueError(
                 f"{name} {TIME_COL} has values not listed in metadata timepoint: "
                 f"{sorted(adata_time_vals - meta_time_vals)}"
@@ -259,8 +264,8 @@ metrics_callback = cellflow.training.Metrics(metrics=["mmd", "e_distance"])
 callbacks = [metrics_callback]
 
 cf.train(
-        num_iterations=150_000,
-        batch_size=512,
+        num_iterations=150,
+        batch_size=16,
         callbacks=callbacks,
         valid_freq=30_000,
     )
