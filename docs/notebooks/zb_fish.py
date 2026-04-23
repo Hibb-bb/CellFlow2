@@ -80,7 +80,10 @@ def concat_h5ad_dir(directory: Path) -> ad.AnnData:
     h5ad_paths = sorted(directory.glob("*.h5ad"))
     if not h5ad_paths:
         raise FileNotFoundError(f"No .h5ad files found in {directory}")
-    return ad.concat([ad.read_h5ad(p) for p in h5ad_paths], axis=0, merge="same")
+    # return ad.concat([ad.read_h5ad(p) for p in h5ad_paths], axis=0, merge="same")
+    return ad.concat([ad.read_h5ad(p) for p in h5ad_paths[:2]], axis=0, merge="same")
+
+
 
 
 def _assert_obs_columns(adata: ad.AnnData, label: str) -> None:
@@ -265,9 +268,9 @@ callbacks = [metrics_callback]
 
 cf.train(
         num_iterations=150,
-        batch_size=16,
+        batch_size=4,
         callbacks=callbacks,
-        valid_freq=30_000,
+        valid_freq=10,
     )
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -298,9 +301,9 @@ for ax, key in zip(axes, _ed_keys):
 
 
 plt.tight_layout()
-plt.savefig("stuff.png")
+plt.savefig("energy.png")
 
-cf = CellFlow.load(str(CHECKPOINT_PATH))
+# cf = CellFlow.load(str(CHECKPOINT_PATH))
 
 # --- Post-training analysis (201_zebrafish_continuous-style; Marson obs / categorical time) ---
 covariate_data_train = (
@@ -356,14 +359,15 @@ def duplicate_across_observed_timepoints(df, time_values):
             rows.append(r)
     return pd.DataFrame(rows)
 
-
-time_values_sorted = sorted(adata.obs[TIME_COL].unique(), key=lambda x: (str(type(x)), str(x)))
+TIME_ORDER = ["rest", "8hr", "48hr"]
+time_values_sorted = [t for t in TIME_ORDER if t in adata.obs[TIME_COL].unique()]
+# time_values_sorted = sorted(adata.obs[TIME_COL].unique(), key=lambda x: (str(type(x)), str(x)))
 covariate_data_interpolated = duplicate_across_observed_timepoints(
     covariate_data_test.iloc[[0]],
     time_values_sorted,
 )
 
-baseline_time = adata.obs[TIME_COL].iloc[0]
+baseline_time = "rest"
 adata_ctrl = adata[
     adata.obs[CONTROL_COL].to_numpy() & (adata.obs[TIME_COL] == baseline_time)
 ].copy()
@@ -379,7 +383,7 @@ adata_preds = []
 for cond, array in preds.items():
     obs_data = pd.DataFrame({CONDITION_COL: [cond] * array.shape[0]})
     adata_pred = ad.AnnData(X=np.empty((len(array), adata_train.n_vars)), obs=obs_data)
-    adata_pred.obsm[sample_rep] = np.squeeze(array)
+    adata_pred.obsm[sample_rep] = array
     adata_preds.append(adata_pred)
 
 adata_preds = ad.concat(adata_preds)
