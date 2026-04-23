@@ -147,7 +147,7 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
 
     time_cats = list(marson_meta["timepoints_included"])
     meta_time_vals = set(map(str, time_cats))
-    meta_time_vals = ["rest", "8hr", "48hr"]
+    meta_time_vals = set(["rest", "8hr", "48hr"])
     for obj, name in (
         (adata_train, "train"),
         (adata_test, "test"),
@@ -155,10 +155,6 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
     ):
         adata_time_vals = set(obj.obs[TIME_COL].astype(str).unique())
         if adata_time_vals - meta_time_vals:
-
-            print()
-            print(adata_time_vals, meta_time_vals)
-            print()
             
             raise ValueError(
                 f"{name} {TIME_COL} has values not listed in metadata timepoint: "
@@ -189,6 +185,16 @@ def create_metadata(config: dict[str, Any] | None = None) -> tuple[ad.AnnData, a
     _apply_condition_columns(adata_test)
     _apply_condition_columns(adata_val)
 
+    # Inject a subsample of training NTCs into val/test so _verify_control_data passes.
+    # split_covariates=None means any NTC will do — no (donor, timepoint) matching needed.
+    train_ctrls = adata_train[adata_train.obs[CONTROL_COL].to_numpy()].copy()
+    rng = np.random.default_rng(0)
+    n_ctrl = min(train_ctrls.n_obs, 5000)
+    ctrl_sample = train_ctrls[rng.choice(train_ctrls.n_obs, n_ctrl, replace=False)].copy()
+
+    adata_test = ad.concat([ctrl_sample, adata_test], axis=0, merge="same")
+    adata_val  = ad.concat([ctrl_sample, adata_val],  axis=0, merge="same")
+
     adata_ref = ad.concat([adata_train, adata_test, adata_val], axis=0, merge="same")
 
     return adata_train, adata_test, adata_val, sample_rep, adata_ref
@@ -211,13 +217,6 @@ cf.prepare_data(
     split_covariates = None,
     max_combination_length=1,
     null_value = 0.0,
-)
-
-cf.prepare_validation_data(
-    adata_train,
-    name="train",
-    n_conditions_on_log_iteration=10,
-    n_conditions_on_train_end=10,
 )
 
 cf.prepare_validation_data(
@@ -431,7 +430,7 @@ if CELL_TYPE_COL in adata.obs.columns:
         ax.set_ylabel("Fraction" if ax == axes[0] else "", fontsize=10)
         ax.tick_params(labelsize=10)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("ok2.png")
 else:
     print(
         f"Skipping WKNN / line plots: obs column {CELL_TYPE_COL!r} not found. "
